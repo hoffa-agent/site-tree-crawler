@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"flag"
 	"fmt"
+	"html"
 	"io"
 	"net/http"
 	"net/url"
@@ -104,6 +105,84 @@ func (t *tree) renderPlain(rootLabel string, scanned, queued, found int64, curre
 		b.WriteByte('\n')
 	}
 	return b.String()
+}
+
+func (t *tree) renderHTML(base *url.URL, scanned, queued, found int64) string {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	var b strings.Builder
+	title := "Site tree for " + base.Hostname()
+	fmt.Fprintf(&b, `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>%s</title>
+  <style>
+    :root { color-scheme: light dark; font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; --bg:#f7f7fb; --card:#fff; --ink:#151922; --muted:#667085; --line:#d8dce5; --accent:#2563eb; }
+    @media (prefers-color-scheme: dark) { :root { --bg:#0f1218; --card:#171b24; --ink:#eef2f8; --muted:#a3adbd; --line:#303746; --accent:#7db2ff; } }
+    body { margin: 0; background: var(--bg); color: var(--ink); }
+    main { width: min(1100px, calc(100%% - 32px)); margin: 0 auto; padding: 42px 0; }
+    header { margin-bottom: 20px; }
+    h1 { margin: 0 0 8px; font-size: clamp(32px, 5vw, 56px); letter-spacing: -.05em; }
+    .meta { color: var(--muted); font-weight: 650; }
+    .tree { background: var(--card); border: 1px solid var(--line); border-radius: 22px; padding: 22px; overflow: auto; box-shadow: 0 16px 44px rgba(0,0,0,.08); }
+    ul { list-style: none; margin: 0; padding-left: 1.35rem; border-left: 1px solid var(--line); }
+    ul.root { padding-left: 0; border-left: 0; }
+    li { margin: .28rem 0; white-space: nowrap; }
+    a { color: var(--ink); text-decoration: none; border-radius: 8px; padding: 2px 4px; }
+    a:hover { color: var(--accent); background: color-mix(in srgb, var(--accent) 12%%, transparent); }
+    .dir > a { font-weight: 800; }
+    .file > a { color: var(--accent); }
+    .icon { display: inline-block; width: 1.35rem; }
+    .root-link { display:inline-block; margin-bottom: .75rem; font-weight: 900; color: var(--accent); }
+  </style>
+</head>
+<body>
+<main>
+<header>
+  <h1>%s</h1>
+  <div class="meta">Generated %s · scanned %d pages · queued %d · found %d paths</div>
+</header>
+<section class="tree">
+  <a class="root-link" href="%s">/ %s</a>
+  <ul class="root">
+`, html.EscapeString(title), html.EscapeString(title), html.EscapeString(time.Now().Format(time.RFC1123)), scanned, queued, found, html.EscapeString(base.String()), html.EscapeString(base.Hostname()))
+	children := sortedChildren(t.root)
+	for _, c := range children {
+		renderHTMLNode(&b, base, c, "")
+	}
+	b.WriteString(`  </ul>
+</section>
+</main>
+</body>
+</html>
+`)
+	return b.String()
+}
+
+func renderHTMLNode(b *strings.Builder, base *url.URL, n *node, parent string) {
+	fullPath := cleanPath(parent + "/" + n.Name)
+	link := *base
+	link.Path = fullPath
+	link.RawQuery = ""
+	link.Fragment = ""
+	className := "dir"
+	icon := "📁"
+	if n.IsFile {
+		className = "file"
+		icon = "📄"
+	}
+	fmt.Fprintf(b, "    <li class=\"%s\"><span class=\"icon\">%s</span><a href=\"%s\">%s</a>", className, icon, html.EscapeString(link.String()), html.EscapeString(n.Name))
+	kids := sortedChildren(n)
+	if len(kids) > 0 {
+		b.WriteString("\n      <ul>\n")
+		for _, c := range kids {
+			renderHTMLNode(b, base, c, fullPath)
+		}
+		b.WriteString("      </ul>\n    ")
+	}
+	b.WriteString("</li>\n")
 }
 
 func sortedChildren(n *node) []*node {
@@ -444,6 +523,7 @@ func main() {
 	workers := flag.Int("workers", 8, "concurrent fetch workers")
 	insecure := flag.Bool("insecure", false, "skip TLS certificate verification")
 	plain := flag.Bool("plain", false, "disable live TUI; print final tree only")
+	htmlOut := flag.String("html", "", "write a clickable HTML tree report to this file after crawling")
 	flag.Usage = func() {
 		fmt.Fprintf(flag.CommandLine.Output(), "Usage: %s [options] <domain-or-url>\n\n", os.Args[0])
 		flag.PrintDefaults()
@@ -469,6 +549,13 @@ func main() {
 		<-done
 		cur, _ := c.current.Load().(string)
 		fmt.Print(c.tree.renderPlain(base.Hostname(), c.scanned, c.queued, c.found, cur, true))
+		if *htmlOut != "" {
+			if err := writeHTMLReport(*htmlOut, c, base); err != nil {
+				fmt.Fprintln(os.Stderr, "html error:", err)
+				os.Exit(1)
+			}
+			fmt.Fprintf(os.Stderr, "wrote clickable HTML tree to %s\n", *htmlOut)
+		}
 		return
 	}
 
@@ -481,4 +568,15 @@ func main() {
 		fmt.Fprintln(os.Stderr, "tui error:", err)
 		os.Exit(1)
 	}
+	if *htmlOut != "" {
+		if err := writeHTMLReport(*htmlOut, c, base); err != nil {
+			fmt.Fprintln(os.Stderr, "html error:", err)
+			os.Exit(1)
+		}
+		fmt.Printf("wrote clickable HTML tree to %s\n", *htmlOut)
+	}
+}
+
+func writeHTMLReport(filename string, c *crawler, base *url.URL) error {
+	return os.WriteFile(filename, []byte(c.tree.renderHTML(base, c.scanned, c.queued, c.found)), 0644)
 }

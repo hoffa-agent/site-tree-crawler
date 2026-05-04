@@ -4,8 +4,10 @@ A small Go CLI that crawls a website from a single domain/URL and renders a prop
 
 ```bash
 go run . example.com
+# clickable HTML report too
+go run . --html tree.html example.com
 # or
-go build -o site-tree && ./site-tree https://example.com --max-pages 500
+go build -o site-tree && ./site-tree --max-pages 500 --html tree.html https://example.com
 ```
 
 Options:
@@ -13,6 +15,9 @@ Options:
 - `--max-pages` max HTML pages to crawl, default `250`
 - `--workers` concurrent fetch workers, default `8`
 - `--plain` print final tree only, useful for logs/CI or terminals without TUI support
+- `--html <file>` write a clickable HTML tree report after crawling
 - `--insecure` skip TLS verification for broken sites
 
 It stays on the same host (treating `www.` and bare domain as equivalent), strips query strings, and infers files by extensions.
+
+The HTML report preserves the discovered hierarchy and turns every directory/file into a clickable same-site link.
