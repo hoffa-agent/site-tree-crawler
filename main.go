@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"crypto/tls"
 	"flag"
@@ -18,6 +17,9 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 )
 
 type node struct {
@@ -72,15 +74,21 @@ func (t *tree) add(rawPath string) bool {
 	return true
 }
 
-func (t *tree) count() int {
+func (t *tree) snapshotLines(maxLines int) []string {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
-	return len(t.seen)
+	lines := []string{}
+	children := sortedChildren(t.root)
+	for i, c := range children {
+		appendNodeLines(&lines, c, "", i == len(children)-1, maxLines)
+		if maxLines > 0 && len(lines) >= maxLines {
+			break
+		}
+	}
+	return lines
 }
 
-func (t *tree) render(rootLabel string, scanned, queued, found int64, current string, done bool) string {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
+func (t *tree) renderPlain(rootLabel string, scanned, queued, found int64, current string, done bool) string {
 	var b strings.Builder
 	status := "scanning"
 	if done {
@@ -91,10 +99,9 @@ func (t *tree) render(rootLabel string, scanned, queued, found int64, current st
 		fmt.Fprintf(&b, "current: %s\n", current)
 	}
 	fmt.Fprintf(&b, "\n%s\n", rootLabel)
-	children := sortedChildren(t.root)
-	for i, c := range children {
-		last := i == len(children)-1
-		renderNode(&b, c, "", last)
+	for _, line := range t.snapshotLines(0) {
+		b.WriteString(line)
+		b.WriteByte('\n')
 	}
 	return b.String()
 }
@@ -113,7 +120,10 @@ func sortedChildren(n *node) []*node {
 	return kids
 }
 
-func renderNode(b *strings.Builder, n *node, prefix string, last bool) {
+func appendNodeLines(lines *[]string, n *node, prefix string, last bool, maxLines int) {
+	if maxLines > 0 && len(*lines) >= maxLines {
+		return
+	}
 	branch := "├── "
 	nextPrefix := prefix + "│   "
 	if last {
@@ -124,10 +134,10 @@ func renderNode(b *strings.Builder, n *node, prefix string, last bool) {
 	if n.IsFile {
 		icon = "📄 "
 	}
-	fmt.Fprintf(b, "%s%s%s%s\n", prefix, branch, icon, n.Name)
+	*lines = append(*lines, prefix+branch+icon+n.Name)
 	kids := sortedChildren(n)
 	for i, c := range kids {
-		renderNode(b, c, nextPrefix, i == len(kids)-1)
+		appendNodeLines(lines, c, nextPrefix, i == len(kids)-1, maxLines)
 	}
 }
 
@@ -213,7 +223,7 @@ func (c *crawler) scan(ctx context.Context, raw string) {
 	if err != nil {
 		return
 	}
-	req.Header.Set("User-Agent", "site-tree-crawler/0.1 (+https://github.com)")
+	req.Header.Set("User-Agent", "site-tree-crawler/0.2")
 	resp, err := c.client.Do(req)
 	if err != nil {
 		return
@@ -292,12 +302,7 @@ func cleanPath(p string) string {
 	return path.Clean(p)
 }
 
-func looksLikeFile(name string) bool {
-	if strings.Contains(name, ".") {
-		return true
-	}
-	return false
-}
+func looksLikeFile(name string) bool { return strings.Contains(name, ".") }
 
 func shouldCrawl(p string) bool {
 	ext := strings.ToLower(path.Ext(p))
@@ -338,12 +343,107 @@ func normalizeInput(s string) (*url.URL, error) {
 	return u, nil
 }
 
+type tickMsg struct{}
+type doneMsg struct{}
+
+type uiModel struct {
+	crawler *crawler
+	base    *url.URL
+	done    bool
+	width   int
+	height  int
+}
+
+var (
+	titleStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("39"))
+	mutedStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
+	okStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("42")).Bold(true)
+	warnStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
+	borderStyle = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).Padding(0, 1)
+)
+
+func (m uiModel) Init() tea.Cmd {
+	return tea.Tick(120*time.Millisecond, func(time.Time) tea.Msg { return tickMsg{} })
+}
+
+func (m uiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.KeyMsg:
+		switch msg.String() {
+		case "q", "ctrl+c", "esc":
+			return m, tea.Quit
+		}
+	case tea.WindowSizeMsg:
+		m.width = msg.Width
+		m.height = msg.Height
+	case tickMsg:
+		if m.done {
+			return m, nil
+		}
+		return m, tea.Tick(120*time.Millisecond, func(time.Time) tea.Msg { return tickMsg{} })
+	case doneMsg:
+		m.done = true
+		return m, tea.Quit
+	}
+	return m, nil
+}
+
+func (m uiModel) View() string {
+	status := warnStyle.Render("scanning")
+	if m.done {
+		status = okStyle.Render("done")
+	}
+	cur, _ := m.crawler.current.Load().(string)
+	if cur == "" {
+		cur = "—"
+	}
+	if m.width <= 0 {
+		m.width = 100
+	}
+	if m.height <= 0 {
+		m.height = 32
+	}
+
+	header := titleStyle.Render("site-tree") + " " + status + fmt.Sprintf("  scanned %d  queued %d  found %d", m.crawler.scanned, m.crawler.queued, m.crawler.found)
+	current := mutedStyle.Render("current: ") + truncate(cur, max(20, m.width-10))
+	root := titleStyle.Render(m.base.Hostname())
+	available := max(3, m.height-7)
+	lines := m.crawler.tree.snapshotLines(available + 1)
+	truncated := len(lines) > available
+	if truncated {
+		lines = lines[:available]
+	}
+	body := root + "\n" + strings.Join(lines, "\n")
+	if truncated {
+		body += "\n" + mutedStyle.Render("… more discovered paths hidden; enlarge terminal or use --plain")
+	}
+	footer := mutedStyle.Render("q/esc/ctrl+c quit · --plain prints final tree without TUI")
+	content := header + "\n" + current + "\n\n" + body + "\n\n" + footer
+	return borderStyle.Width(max(30, m.width-2)).Render(content)
+}
+
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	if n <= 1 {
+		return "…"
+	}
+	return s[:n-1] + "…"
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
 func main() {
 	maxPages := flag.Int("max-pages", 250, "maximum HTML pages to crawl")
 	workers := flag.Int("workers", 8, "concurrent fetch workers")
 	insecure := flag.Bool("insecure", false, "skip TLS certificate verification")
-	interval := flag.Duration("refresh", 180*time.Millisecond, "TUI refresh interval")
-	plain := flag.Bool("plain", false, "disable live screen clearing; print final tree only")
+	plain := flag.Bool("plain", false, "disable live TUI; print final tree only")
 	flag.Usage = func() {
 		fmt.Fprintf(flag.CommandLine.Output(), "Usage: %s [options] <domain-or-url>\n\n", os.Args[0])
 		flag.PrintDefaults()
@@ -367,26 +467,18 @@ func main() {
 
 	if *plain {
 		<-done
-		fmt.Print(c.tree.render(base.Hostname(), c.scanned, c.queued, c.found, "", true))
+		cur, _ := c.current.Load().(string)
+		fmt.Print(c.tree.renderPlain(base.Hostname(), c.scanned, c.queued, c.found, cur, true))
 		return
 	}
 
-	w := bufio.NewWriter(os.Stdout)
-	t := time.NewTicker(*interval)
-	defer t.Stop()
-	for {
-		select {
-		case <-done:
-			fmt.Fprint(w, "\033[H\033[2J")
-			cur, _ := c.current.Load().(string)
-			fmt.Fprint(w, c.tree.render(base.Hostname(), c.scanned, c.queued, c.found, cur, true))
-			w.Flush()
-			return
-		case <-t.C:
-			fmt.Fprint(w, "\033[H\033[2J")
-			cur, _ := c.current.Load().(string)
-			fmt.Fprint(w, c.tree.render(base.Hostname(), c.scanned, c.queued, c.found, cur, false))
-			w.Flush()
-		}
+	p := tea.NewProgram(uiModel{crawler: c, base: base}, tea.WithAltScreen())
+	go func() {
+		<-done
+		p.Send(doneMsg{})
+	}()
+	if _, err := p.Run(); err != nil {
+		fmt.Fprintln(os.Stderr, "tui error:", err)
+		os.Exit(1)
 	}
 }
